@@ -1,0 +1,15 @@
+project: robomimic-vla-compression  # Your project name
+method: grid                       # Try every combination
+metric:
+  goal: maximize
+  name: eval/Success_Rate          # The metric we log in sweep_train.py
+parameters:
+  crf:
+    values: [10, 15, 20, 25, 30, 35, 40, 45, 50]   # The compression rates to test
+  task:
+    value: "can"                   # Keep task fixed for this sweep
+  num_epochs:
+    value: 50
+  batch_size:
+    value: 256
+program: sweep_train.py
