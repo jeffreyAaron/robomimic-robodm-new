@@ -1,17 +1,17 @@
 import os
-import argparse
 import wandb
 import torch
 import numpy as np
-import subprocess
-import json
 from datetime import datetime
 
-import robomimic
 import robomimic.utils.torch_utils as TorchUtils
 from robomimic.config import config_factory
 from robomimic.scripts.train import train
 from robomimic.scripts.run_trained_agent import run_trained_agent
+
+from custom.wrappers.saliency_wrapper import SaliencyWrapper
+from custom.utils.eval_utils import EvalArgs
+from custom.utils.dataset_utils import DatasetManager
 
 def main():
     # 1. Setup WandB Sweep logic
@@ -35,63 +35,19 @@ def main():
     crf = getattr(config, "crf", 23)
     num_epochs = getattr(config, "num_epochs", 500)
     batch_size = getattr(config, "batch_size", 256)
+    seed = getattr(config, "seed", 42)
     
-    print(f"Starting run for task: {task}, CRF: {crf}")
+    print(f"Starting run for task: {task}, CRF: {crf}, Seed: {seed}")
+    
+    # Set seeds for reproducibility
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     
     # 2. Dataset Preparation
-    # We assume the base dataset exists at datasets/{task}/ph/image_v15.hdf5
-    base_dataset = f"datasets/{task}/ph/image_v15.hdf5"
-    vla_dir = f"datasets/{task}/ph/image_v15_vla_crf{crf}"
-    reconstructed_hdf5 = f"datasets/{task}/ph/image_v15_reconstructed_crf{crf}.hdf5"
-    
-    # Set environment for subprocess to include robodm
-    env = os.environ.copy()
-    robodm_path = os.path.abspath("robodm")
-    if "PYTHONPATH" in env:
-        env["PYTHONPATH"] = f"{env['PYTHONPATH']}:{robodm_path}"
-    else:
-        env["PYTHONPATH"] = robodm_path
-
-    if not os.path.exists(reconstructed_hdf5):
-        print(f"Reconstructed dataset not found at {reconstructed_hdf5}. Generating for CRF {crf}...")
-        
-        # Robomimic to VLA (compression)
-        cmd_to_vla = [
-            "python", "robomimic_to_vla_compressed.py",
-            "--dataset", base_dataset,
-            "--output_dir", vla_dir,
-            "--crf", str(crf)
-        ]
-        print(f"Running: {' '.join(cmd_to_vla)}")
-        subprocess.run(cmd_to_vla, check=True, env=env)
-        
-        # VLA to Robomimic (reconstruction)
-        cmd_from_vla = [
-            "python", "vla_to_robomimic.py",
-            "--vla_dir", vla_dir,
-            "--output_path", reconstructed_hdf5
-        ]
-        print(f"Running: {' '.join(cmd_from_vla)}")
-        subprocess.run(cmd_from_vla, check=True, env=env)
-        
-        # Calculate and print directory size to verify compression
-        total_size = 0
-        for dirpath, dirnames, filenames in os.walk(vla_dir):
-            for f in filenames:
-                fp = os.path.join(dirpath, f)
-                total_size += os.path.getsize(fp)
-        
-        vla_size_mb = total_size / (1024 * 1024)
-        print(f"Total VLA directory size (CRF {crf}): {vla_size_mb:.2f} MB")
-        
-        # Log VLA size to WandB
-        run.log({"vla_dataset_size_mb": vla_size_mb})
-        run.summary["vla_dataset_size_mb"] = vla_size_mb
-        
-        print(f"Intermediate VLA files kept at: {vla_dir}")
-        # shutil.rmtree(vla_dir)
-    else:
-        print(f"Using existing reconstructed dataset at {reconstructed_hdf5}")
+    dataset_manager = DatasetManager(task, crf)
+    reconstructed_hdf5 = dataset_manager.prepare_dataset()
 
     # 3. Training Setup
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
@@ -110,6 +66,20 @@ def main():
     robomimic_config.train.batch_size = batch_size
     robomimic_config.train.num_epochs = num_epochs
     
+    # Configure Image-based training
+    # 1. Enable RGB modalities
+    robomimic_config.observation.modalities.obs.rgb = ["agentview_image", "robot0_eye_in_hand_image"]
+    
+    # 2. Configure Low-dim modalities (removing 'object' as requested)
+    robomimic_config.observation.modalities.obs.low_dim = [
+        "robot0_eef_pos", 
+        "robot0_eef_quat", 
+        "robot0_gripper_qpos"
+    ]
+    
+    # 3. Increase data workers for image loading
+    robomimic_config.train.num_data_workers = 2
+    
     # Enable WandB in Robomimic internal logger
     robomimic_config.experiment.logging.log_wandb = True
     robomimic_config.experiment.logging.wandb_proj_name = run.project
@@ -127,6 +97,19 @@ def main():
     # 4. Launch Training
     print(f"Starting training. Experiment: {run_name}")
     
+    # Monkey-patch algo_factory to wrap the model with SaliencyWrapper
+    import robomimic.algo as Algo
+    import robomimic.scripts.train as TrainScript
+    original_algo_factory = Algo.algo_factory
+
+    def patched_algo_factory(*args, **kwargs):
+        algo = original_algo_factory(*args, **kwargs)
+        print(f"Creating SaliencyWrapper for algo {type(algo)}")
+        return SaliencyWrapper(algo)
+
+    Algo.algo_factory = patched_algo_factory
+    TrainScript.algo_factory = patched_algo_factory
+
     # HACK: Robomimic's training script calls wandb.finish() at the end, 
     # which would close the run before we can log evaluation results.
     # We temporarily monkeypatch wandb.finish to be a no-op.
@@ -165,23 +148,6 @@ def main():
         checkpoint_path = matching_ckpts[-1]
 
     print(f"Evaluating checkpoint: {checkpoint_path}")
-
-    # Helper class to mimic argparse results for run_trained_agent
-    class EvalArgs:
-        def __init__(self, agent, n_rollouts=50, horizon=None, env=None, render=False, 
-                     video_path=None, video_skip=5, camera_names=None, dataset_path=None, 
-                     dataset_obs=False, seed=0):
-            self.agent = agent
-            self.n_rollouts = n_rollouts
-            self.horizon = horizon
-            self.env = env
-            self.render = render
-            self.video_path = video_path
-            self.video_skip = video_skip
-            self.camera_names = camera_names or ["agentview", "robot0_eye_in_hand"]
-            self.dataset_path = dataset_path
-            self.dataset_obs = dataset_obs
-            self.seed = seed
 
     # Standard evaluation: 50 rollouts
     eval_args = EvalArgs(agent=checkpoint_path, n_rollouts=50)
