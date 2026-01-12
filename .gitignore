@@ -39,10 +39,10 @@ datasets/
 *.vla
 *.hdf5
 
-# External Libraries
-robomimic/
-robosuite/
-robodm/
+# # External Libraries
+# robomimic/
+# robosuite/
+# robodm/
 
 # System
 .DS_Store
