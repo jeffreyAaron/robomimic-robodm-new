@@ -5,13 +5,13 @@ import numpy as np
 from datetime import datetime
 
 import robomimic.utils.torch_utils as TorchUtils
-from robomimic.config import config_factory
 from robomimic.scripts.train import train
 from robomimic.scripts.run_trained_agent import run_trained_agent
 
 from custom.wrappers.saliency_wrapper import SaliencyWrapper
 from custom.utils.eval_utils import EvalArgs
 from custom.utils.dataset_utils import DatasetManager
+from custom.configs.algo_configs import get_config_by_name
 
 def main():
     # 1. Setup WandB Sweep logic
@@ -56,40 +56,18 @@ def main():
     # Set output_dir to 'test_output' so robomimic creates 'test_output/{run_name}/{timestamp}'
     output_parent_dir = os.path.abspath("test_output")
     
-    # Load default BC config
-    robomimic_config = config_factory(algo_name="bc")
+    # 3. Training Setup - Modular Algorithm Selection
+    algo_name = getattr(config, "algo", "bc_rnn")
+    algo_config_obj = get_config_by_name(algo_name)
     
-    # Update config with parameters
-    robomimic_config.experiment.name = run_name
-    robomimic_config.train.output_dir = output_parent_dir
-    robomimic_config.train.data = [{"path": reconstructed_hdf5}]
-    robomimic_config.train.batch_size = batch_size
-    robomimic_config.train.num_epochs = num_epochs
-    
-    # Configure Image-based training
-    # 1. Enable RGB modalities
-    robomimic_config.observation.modalities.obs.rgb = ["agentview_image", "robot0_eye_in_hand_image"]
-    
-    # 2. Configure Low-dim modalities (removing 'object' as requested)
-    robomimic_config.observation.modalities.obs.low_dim = [
-        "robot0_eef_pos", 
-        "robot0_eef_quat", 
-        "robot0_gripper_qpos"
-    ]
-    
-    # 3. Increase data workers for image loading
-    robomimic_config.train.num_data_workers = 2
-    
-    # Enable WandB in Robomimic internal logger
-    robomimic_config.experiment.logging.log_wandb = True
-    robomimic_config.experiment.logging.wandb_proj_name = run.project
-    
-    # Enable rollouts during training
-    robomimic_config.experiment.rollout.enabled = True
-    robomimic_config.experiment.rollout.rate = 100 
-    
-    # Algo settings (matching simple_test.py)
-    robomimic_config.algo.gmm.enabled = False
+    robomimic_config = algo_config_obj.configure(
+        run_name=run_name,
+        output_dir=output_parent_dir,
+        dataset_path=reconstructed_hdf5,
+        batch_size=batch_size,
+        num_epochs=num_epochs,
+        wandb_proj_name=run.project
+    )
     
     # Get torch device
     device = TorchUtils.get_torch_device(try_to_use_cuda=True)
@@ -97,6 +75,20 @@ def main():
     # 4. Launch Training
     print(f"Starting training. Experiment: {run_name}")
     
+    # Monkey-patch DataLogger to also log rollout metrics to 'eval/' for plotting
+    from robomimic.utils.log_utils import DataLogger
+    original_record = DataLogger.record
+    def patched_record(self, k, v, epoch, data_type='scalar', log_stats=False):
+        if k.startswith("Rollout/") and data_type == 'scalar':
+            # k looks like "Rollout/MetricName/EnvName"
+            parts = k.split("/")
+            if len(parts) == 3:
+                metric_name = parts[1]
+                # Also log as eval/MetricName for consistency across training
+                wandb.log({f"eval/{metric_name}": v}, step=epoch)
+        original_record(self, k, v, epoch, data_type, log_stats)
+    DataLogger.record = patched_record
+
     # Monkey-patch algo_factory to wrap the model with SaliencyWrapper
     import robomimic.algo as Algo
     import robomimic.scripts.train as TrainScript
@@ -159,7 +151,7 @@ def main():
     if eval_stats:
         print("Logging evaluation stats to WandB...")
         formatted_stats = {f"eval/{k}": v for k, v in eval_stats.items()}
-        wandb.log(formatted_stats)
+        wandb.log(formatted_stats, step=num_epochs)
         
         # Update summary for easy comparison in the WandB table
         for k, v in formatted_stats.items():
