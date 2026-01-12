@@ -1,0 +1,6 @@
+include README.md
+include LICENSE
+include HISTORY.md
+graft robodm
+global-exclude *.pyc
+global-exclude __pycache__
